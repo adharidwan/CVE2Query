@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cve2checker"
+version = "0.1.0"
+description = "Evidence-gated CVE-to-CodeQL query generation tooling"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+cve2checker = "cve2checker.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["cve2checker*"]
