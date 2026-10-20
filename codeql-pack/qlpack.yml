@@ -1,0 +1,5 @@
+name: cve2checker/cpp-baseline-queries
+version: 0.0.1
+dependencies:
+  codeql/cpp-all: 12.2.0
+extractor: cpp

@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.cache/
+.venv/
+.env
+.tools/
+artifacts/
+artifacts-demo/
+codeql-db/
+*.sarif
