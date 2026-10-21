@@ -10,7 +10,7 @@ CVE2Checker is an evidence-driven pipeline that turns a C/C++ CVE into a custom 
 | 1 | CVE reference/source discovery, git evidence, diff/context extraction, DB build modes | Complete |
 | 2 | Feasibility and root-cause schemas/prompts, LLM client, citation enforcement | Complete |
 | 3 | SARIF parsing, diff-aware validator, iterative synthesis loop, LSP/RAG tools | Complete |
-| 4 | LangGraph orchestration, checkpoints, full CLI graph | Not implemented |
+| 4 | Single-command checkpointed orchestrator, resume, manifest/report | Implemented (sequential; LangGraph optional) |
 | 5 | C/C++ benchmark, ablations, evaluation report | Not implemented |
 
 The synthesis loop is usable, but it is not yet a benchmarked CVE-to-query system. Do not treat a successful query as proof of a vulnerability outside the supplied vulnerable/fixed pair.
@@ -94,6 +94,10 @@ CVE2CHECKER_LLM_API_KEY=
 OPENCODE_API_KEY=put-your-opencode-go-key-here
 CVE2CHECKER_LLM_TIMEOUT=600
 CVE2CHECKER_LLM_MAX_TOKENS=32768
+CVE2CHECKER_LLM_RETRIES=3
+CVE2CHECKER_LLM_BACKOFF=2
+# Optional same-endpoint fallback models:
+# CVE2CHECKER_LLM_FALLBACK_MODELS=glm-5.3-flash,mimo-v2.6-flash
 ```
 
 Get the key from the [OpenCode Console](https://opencode.ai/console) (the same key used by `/connect` with OpenCode Go). The CLI loads `.env` automatically; existing shell environment variables win. Paste only the key into `OPENCODE_API_KEY`. For a stronger model, replace `deepseek-v4.1-flash` with `deepseek-v4-pro`. The client sends a stable `x-opencode-session` header for Go prompt caching. A small 1.5B local model is not sufficient for reliable schema/query generation.
@@ -159,7 +163,35 @@ python main.py synthesize `
   --rag-db .cache/cve2checker/rag.sqlite
 ```
 
-Defaults: 10 outer iterations, 50 tool calls per iteration. The model must respond with either `{"tool": ...}` or `{"final": "<query>"}`. LSP tools are enabled by default; `--no-lsp` disables them.
+Defaults: 10 outer iterations, 50 tool calls per iteration. The model must respond with a tool call or a final query; JSON, DSML, and XML tool formats are accepted. LSP tools are enabled by default; `--no-lsp` disables them. `--strict-fixed` rejects any fixed-side alert, even outside the patch.
+
+### 9. Run the whole pipeline with one command
+
+```powershell
+python main.py generate `
+  --cve-id CVE-2022-37434 `
+  --cve-file .cache/cve2checker/CVE-2022-37434.json `
+  --repo-path C:\src\zlib `
+  --fix-commit eff308af425b67093bab25f80f1ae950166bece1 `
+  --output-dir artifacts `
+  --build-mode none `
+  --rag-db .cache/cve2checker/rag.sqlite
+```
+
+`generate` derives the vulnerable parent commit, creates worktrees and both databases, runs feasibility and root-cause agents, runs the synthesis loop with a generated-query pack, validates each candidate, and writes the final report. It checkpoints after every stage; rerun with `--resume` to continue. Outputs:
+
+```text
+artifacts/<CVE>/
+  state.json
+  generated-analysis/
+  generated-synthesis/
+  final/query.ql
+  final/validation_report.json
+  final/manifest.json
+  final/report.md
+```
+
+The orchestrator is sequential and checkpointed. It is not a LangGraph workflow.
 
 ## Implemented modules
 
@@ -182,7 +214,8 @@ cve2checker/
   sarif.py         SARIF 2.1.0 parsing and location matching
   validator.py     compile/analyze/score loop feedback
   synthesis.py     tool-using synthesis and repair loop
-  cli.py           CLI commands
+  report.py        run manifest and Markdown report
+  cli.py           CLI commands and checkpointed generate orchestrator
 codeql-pack/       query pack and demonstration query
 tests/             offline unit tests and opt-in real-tool integrations
 ```
@@ -203,11 +236,11 @@ python -m unittest tests.test_lsp.RealCodeQLLSPTests -v
 Remove-Item Env:CVE2CHECKER_LSP_INTEGRATION
 
 $env:CVE2CHECKER_CODEQL_INTEGRATION="1"
-python -m unittest tests.test_validator_integration -v
+python -m unittest tests.test_validator_integration tests.test_e2e_integration -v
 Remove-Item Env:CVE2CHECKER_CODEQL_INTEGRATION
 ```
 
-The real validator test creates two tiny C databases, runs the baseline query, and requires a vulnerable hit with no fixed hit.
+The real validator test creates two tiny C databases, runs the baseline query, and requires a vulnerable hit with no fixed hit. The end-to-end test runs the synthesis loop with a scripted agent and real CodeQL databases.
 
 ## Validated demo
 
@@ -227,5 +260,7 @@ The generated query is broader than the reference query: it reports one fixed-si
 - The feasibility/root-cause agents require an external LLM. Tests use a scripted backend.
 - The tool protocol is a simple JSON ReAct loop, not native Claude Code/MCP tool use. QLCoder-style backends can be added behind the same `LLMClient` interface.
 - CVE-to-source discovery relies on GitHub references and does not yet search arbitrary code hosts or map every CWE.
-- The benchmark, held-out evaluation, and LangGraph orchestration are not implemented.
+- The benchmark, held-out evaluation, and LangGraph workflow are not implemented.
+- Model availability matters: OpenCode Go endpoints can return 503 or time out. The client retries transient failures and supports same-endpoint fallback models, but a capable model is still required.
+- Default success follows the QLCoder predicate (no fixed-side alert intersecting the patch). Use `--strict-fixed` to reject any fixed-side alert.
 - CodeQL licensing and terms apply to its use. QLCoder is MIT-licensed; this project adapts its architecture, not its Java-specific prompts or evaluation data.

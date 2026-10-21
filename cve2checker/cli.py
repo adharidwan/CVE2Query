@@ -6,7 +6,9 @@ import argparse
 import getpass
 import json
 import os
+import shutil
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
@@ -30,10 +32,12 @@ from .agents import AgentError, run_feasibility, run_root_cause, write_json_arti
 from .diff import changed_ranges, parse_unified_diff
 from .env import load_dotenv, project_env_paths, set_env_value
 from .evidence import EvidenceError, build_evidence
-from .llm import LLMError, OpenAICompatibleClient
+from .git_tools import GitError, add_worktree
+from .llm import LLMError, build_llm_client, llm_from_env
 from .lsp import CodeQLLanguageServer, LSPError
 from .rag import RagError, RagIndex
 from .rag_index import index_directory
+from .report import write_run_report
 from .synthesis import SynthesisError, ToolBox, run_synthesis
 from .validator import ValidationError, validate_query
 
@@ -51,6 +55,16 @@ def _default_codeql_path() -> str:
         if candidate.is_file():
             return str(candidate)
     return "codeql"
+
+
+def _pinned_codeql_version() -> str:
+    project_root = Path(__file__).resolve().parent.parent
+    path = project_root / ".codeql-version"
+    try:
+        version = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "unknown"
+    return version or "unknown"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -207,6 +221,11 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--output-dir", type=Path, required=True)
     validate_parser.add_argument("--iteration", type=int, default=1)
     validate_parser.add_argument("--codeql-path", default=_default_codeql_path(), metavar="PATH")
+    validate_parser.add_argument(
+        "--strict-fixed",
+        action="store_true",
+        help="reject any alert on the fixed database, even outside the patch",
+    )
     validate_parser.add_argument("--json", action="store_true", help="print full feedback JSON")
 
     lsp_parser = subparsers.add_parser("lsp", help="use the CodeQL language server")
@@ -219,6 +238,42 @@ def build_parser() -> argparse.ArgumentParser:
         "--pack-root", type=Path, default=Path("codeql-pack")
     )
     lsp_diagnostics_parser.add_argument("--codeql-path", default=_default_codeql_path(), metavar="PATH")
+
+    generate_parser = subparsers.add_parser(
+        "generate", help="run the complete CVE-to-validated-query pipeline"
+    )
+    generate_parser.add_argument("--cve-id", required=True)
+    generate_parser.add_argument("--cve-file", type=Path)
+    generate_parser.add_argument("--repo-path", type=Path)
+    generate_parser.add_argument("--fix-commit")
+    generate_parser.add_argument("--vuln-commit")
+    generate_parser.add_argument("--output-dir", type=Path, default=Path("artifacts"))
+    generate_parser.add_argument(
+        "--cache-dir", type=Path, default=Path(".cache/cve2checker")
+    )
+    generate_parser.add_argument("--refresh", action="store_true")
+    build_group = generate_parser.add_mutually_exclusive_group()
+    build_group.add_argument(
+        "--build-mode", choices=("autobuild", "none"), default="none"
+    )
+    build_group.add_argument("--build-command")
+    generate_parser.add_argument("--context-lines", type=int, default=12)
+    generate_parser.add_argument("--rag-db", type=Path)
+    generate_parser.add_argument(
+        "--codeql-path", default=_default_codeql_path(), metavar="PATH"
+    )
+    generate_parser.add_argument(
+        "--codeql-version", default=_pinned_codeql_version()
+    )
+    generate_parser.add_argument("--max-iterations", type=int, default=10)
+    generate_parser.add_argument("--max-tool-calls", type=int, default=50)
+    generate_parser.add_argument("--max-attempts", type=int, default=2)
+    generate_parser.add_argument("--strict-fixed", action="store_true")
+    generate_parser.add_argument("--no-lsp", action="store_true")
+    generate_parser.add_argument("--resume", action="store_true")
+    generate_parser.add_argument("--llm-base-url")
+    generate_parser.add_argument("--llm-model")
+    generate_parser.add_argument("--llm-api-key")
 
     analyze_parser = subparsers.add_parser(
         "analyze", help="run the feasibility and root-cause agents"
@@ -251,6 +306,11 @@ def build_parser() -> argparse.ArgumentParser:
     synthesize_parser.add_argument("--codeql-version", default="2.27.2")
     synthesize_parser.add_argument("--max-iterations", type=int, default=10)
     synthesize_parser.add_argument("--max-tool-calls", type=int, default=50)
+    synthesize_parser.add_argument(
+        "--strict-fixed",
+        action="store_true",
+        help="reject any alert on the fixed database, even outside the patch",
+    )
     synthesize_parser.add_argument("--llm-base-url")
     synthesize_parser.add_argument("--llm-model")
     synthesize_parser.add_argument("--llm-api-key")
@@ -283,6 +343,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_validate(args)
         if args.command == "lsp":
             return _run_lsp_command(args)
+        if args.command == "generate":
+            return _run_generate(args)
         if args.command == "analyze":
             return _run_analyze(args)
         if args.command == "synthesize":
@@ -293,6 +355,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         CodeQLError,
         RagError,
         EvidenceError,
+        GitError,
         AgentError,
         LSPError,
         LLMError,
@@ -481,6 +544,7 @@ def _run_validate(args: argparse.Namespace) -> int:
         args.output_dir,
         codeql_path=args.codeql_path,
         iteration=args.iteration,
+        strict_fixed=args.strict_fixed,
     )
     if args.json:
         print(json.dumps(feedback, indent=2, ensure_ascii=False))
@@ -520,14 +584,449 @@ def _build_llm(args: argparse.Namespace):
         or None
     )
     if args.llm_base_url and args.llm_model:
-        return OpenAICompatibleClient(
+        fallback_models = [
+            item.strip()
+            for item in os.environ.get("CVE2CHECKER_LLM_FALLBACK_MODELS", "").split(
+                ","
+            )
+            if item.strip()
+        ]
+        return build_llm_client(
             base_url=args.llm_base_url,
             model=args.llm_model,
             api_key=api_key,
+            timeout=float(os.environ.get("CVE2CHECKER_LLM_TIMEOUT", "180")),
+            max_tokens=int(os.environ.get("CVE2CHECKER_LLM_MAX_TOKENS", "32768")),
+            fallback_models=fallback_models,
+            attempts=int(os.environ.get("CVE2CHECKER_LLM_RETRIES", "3")),
+            backoff=float(os.environ.get("CVE2CHECKER_LLM_BACKOFF", "2")),
         )
     if args.llm_base_url or args.llm_model:
         raise ValueError("--llm-base-url and --llm-model must be supplied together")
-    return OpenAICompatibleClient.from_env()
+    return llm_from_env()
+
+
+def _run_generate(args: argparse.Namespace) -> int:
+    cve_id = validate_cve_id(args.cve_id)
+    run_dir = args.output_dir / cve_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    state_path = run_dir / "state.json"
+    state = _read_state(state_path) if args.resume else {"stages": {}}
+    state["cve_id"] = cve_id
+    state.setdefault("stages", {})
+    _save_state(state_path, state)
+
+    cve_path = run_dir / "cve.json"
+    if args.resume and cve_path.is_file():
+        record = parse_record(cve_path.read_bytes(), cve_id)
+    else:
+        record, raw_json = _load_generate_cve(args, cve_id)
+        cve_path.write_bytes(raw_json)
+    _mark_stage(state, state_path, "cve", "completed", path=str(cve_path))
+    print(f"[cve] {cve_id}")
+
+    source_path = run_dir / "source.json"
+    diff_path = run_dir / "diff.patch"
+    context_path = run_dir / "context.json"
+    if (
+        args.resume
+        and _stage_completed(state, "evidence")
+        and all(path.is_file() for path in (source_path, diff_path, context_path))
+    ):
+        evidence = _load_evidence(run_dir)
+    else:
+        evidence = build_evidence(
+            cve_id,
+            record,
+            args.output_dir,
+            repo_path=args.repo_path,
+            fix_commit=args.fix_commit,
+            github_token=os.environ.get("GITHUB_TOKEN"),
+            context_lines=args.context_lines,
+        )
+        _mark_stage(
+            state,
+            state_path,
+            "evidence",
+            "completed",
+            source=evidence["source"].get("repository_url"),
+            vulnerable_commit=evidence["vulnerable_commit"],
+            fix_commit=evidence["fix_commit"],
+        )
+    if args.vuln_commit and evidence["vulnerable_commit"].lower() != args.vuln_commit.lower():
+        raise ValueError(
+            "resolved vulnerable commit does not match --vuln-commit: "
+            f"{evidence['vulnerable_commit']} != {args.vuln_commit}"
+        )
+    print(
+        f"[evidence] {evidence['vulnerable_commit'][:12]} -> "
+        f"{evidence['fix_commit'][:12]}"
+    )
+
+    worktree_root = run_dir / "generated-worktrees"
+    vuln_src = worktree_root / "vulnerable"
+    fix_src = worktree_root / "fixed"
+    db_root = run_dir / "generated-db"
+    vuln_db = db_root / "vulnerable"
+    fixed_db = db_root / "fixed"
+    build_mode = None if args.build_command else args.build_mode
+    build_log = ""
+    if not (
+        args.resume
+        and _stage_completed(state, "databases")
+        and _database_ready(vuln_db)
+        and _database_ready(fixed_db)
+    ):
+        vuln_src = add_worktree(
+            evidence["repo_path"], vuln_src, evidence["vulnerable_commit"]
+        )
+        fix_src = add_worktree(
+            evidence["repo_path"], fix_src, evidence["fix_commit"]
+        )
+        if not _database_ready(vuln_db):
+            create_cpp_database(
+                vuln_src,
+                vuln_db,
+                build_command=args.build_command,
+                build_mode=build_mode,
+                codeql_path=args.codeql_path,
+            )
+        if not _database_ready(fixed_db):
+            create_cpp_database(
+                fix_src,
+                fixed_db,
+                build_command=args.build_command,
+                build_mode=build_mode,
+                codeql_path=args.codeql_path,
+            )
+        build_log = (
+            "CodeQL C/C++ databases created successfully.\n"
+            f"Vulnerable source: {vuln_src} at {evidence['vulnerable_commit']}\n"
+            f"Vulnerable database: {vuln_db}\n"
+            f"Fixed source: {fix_src} at {evidence['fix_commit']}\n"
+            f"Fixed database: {fixed_db}\n"
+            f"Build mode: {build_mode or 'custom build command'}\n"
+        )
+        _mark_stage(
+            state,
+            state_path,
+            "databases",
+            "completed",
+            vulnerable_db=str(vuln_db),
+            fixed_db=str(fixed_db),
+        )
+    print(f"[databases] {vuln_db} | {fixed_db}")
+
+    analysis_dir = run_dir / "generated-analysis"
+    feasibility_path = analysis_dir / "feasibility.json"
+    ir_path = analysis_dir / "vulnerability_ir.json"
+    feasibility: dict | None = None
+    vulnerability_ir: dict | None = None
+    if args.resume and _stage_completed(state, "analysis") and feasibility_path.is_file():
+        feasibility = json.loads(feasibility_path.read_text(encoding="utf-8"))
+        if feasibility.get("decision") == "proceed" and ir_path.is_file():
+            vulnerability_ir = json.loads(ir_path.read_text(encoding="utf-8"))
+    if feasibility is None:
+        llm = _build_llm(args)
+        diff_summary = {
+            "stats": evidence["source"].get("diff_stats", {}),
+            "patch": evidence["diff"],
+        }
+        if not build_log:
+            build_log = (
+                f"Existing CodeQL databases: {vuln_db} and {fixed_db}\n"
+            )
+        feasibility = run_feasibility(
+            record,
+            evidence["source"],
+            diff_summary,
+            llm,
+            build_log=build_log,
+            codeql_version=args.codeql_version,
+            max_attempts=args.max_attempts,
+        )
+        write_json_artifact(feasibility_path, feasibility)
+    if feasibility.get("decision") != "proceed":
+        _mark_stage(state, state_path, "analysis", "blocked", decision=feasibility.get("decision"))
+        _write_generate_report(
+            run_dir,
+            cve_id,
+            status="blocked",
+            stages=state["stages"],
+            evidence=evidence,
+            artifacts={"cve": cve_path, "source": source_path, "diff": diff_path, "context": context_path, "feasibility": feasibility_path},
+            metadata=_generate_metadata(args, evidence),
+            summary={"decision": feasibility.get("decision")},
+        )
+        print(f"[analysis] blocked: {feasibility.get('decision')}")
+        return 1
+    if vulnerability_ir is None:
+        if "llm" not in locals():
+            llm = _build_llm(args)
+        vulnerability_ir = run_root_cause(
+            record,
+            evidence["diff"],
+            evidence["context"],
+            llm,
+            vulnerable_commit=evidence["vulnerable_commit"],
+            fix_commit=evidence["fix_commit"],
+            max_attempts=args.max_attempts,
+        )
+        write_json_artifact(ir_path, vulnerability_ir)
+    _mark_stage(state, state_path, "analysis", "completed", decision="proceed")
+    print(f"[analysis] proceed; IR {ir_path}")
+
+    final_dir = run_dir / "final"
+    final_query = final_dir / f"{cve_id}.ql"
+    final_validation = final_dir / "validation_report.json"
+    if (
+        args.resume
+        and _stage_completed(state, "synthesis")
+        and final_query.is_file()
+        and final_validation.is_file()
+    ):
+        previous = json.loads(final_validation.read_text(encoding="utf-8"))
+        if previous.get("verdict") == "success":
+            print("[synthesis] reusing successful final query")
+            _write_generate_report(
+                run_dir,
+                cve_id,
+                status="success",
+                stages=state["stages"],
+                evidence=evidence,
+                artifacts={
+                    "cve": cve_path,
+                    "source": source_path,
+                    "diff": diff_path,
+                    "context": context_path,
+                    "feasibility": feasibility_path,
+                    "vulnerability_ir": ir_path,
+                    "query": final_query,
+                    "validation_report": final_validation,
+                },
+                metadata=_generate_metadata(args, evidence),
+                summary={"verdict": "success", **previous.get("metrics", {})},
+            )
+            return 0
+
+    synthesis_dir = run_dir / "generated-synthesis"
+    ensure_query_pack(synthesis_dir, codeql_path=args.codeql_path)
+    llm = _build_llm(args)
+    rag = (
+        RagIndex(args.rag_db)
+        if args.rag_db is not None and args.rag_db.is_file()
+        else None
+    )
+    lsp = None
+    if not args.no_lsp:
+        lsp = CodeQLLanguageServer(
+            codeql_path=args.codeql_path, pack_root=synthesis_dir
+        )
+        lsp.start()
+    try:
+        tools = ToolBox(
+            repo_root=Path(evidence["repo_path"]),
+            workdir=synthesis_dir,
+            rag=rag,
+            lsp=lsp,
+        )
+        diffs = parse_unified_diff(evidence["diff"])
+        changed = [
+            *changed_ranges(diffs, "old"),
+            *changed_ranges(diffs, "new"),
+        ]
+
+        def validate(query, iteration_dir, iteration):
+            return validate_query(
+                query,
+                vuln_db,
+                fixed_db,
+                changed,
+                iteration_dir,
+                codeql_path=args.codeql_path,
+                iteration=iteration,
+                strict_fixed=args.strict_fixed,
+            )
+
+        result = run_synthesis(
+            cve_id=cve_id,
+            cve=record,
+            cwe_ids=vulnerability_ir.get("cwe_ids", []),
+            repo_path=evidence["repo_path"],
+            vulnerable_commit=evidence["vulnerable_commit"],
+            fix_commit=evidence["fix_commit"],
+            diff=evidence["diff"],
+            vulnerability_ir=vulnerability_ir,
+            ast_snippets=[],
+            workdir=synthesis_dir,
+            llm=llm,
+            tools=tools,
+            validate=validate,
+            codeql_version=args.codeql_version,
+            max_iterations=args.max_iterations,
+            max_tool_calls=args.max_tool_calls,
+        )
+    finally:
+        if lsp is not None:
+            lsp.stop()
+
+    final_dir.mkdir(parents=True, exist_ok=True)
+    if result.query_path is not None and Path(result.query_path).is_file():
+        shutil.copy2(result.query_path, final_query)
+    result_payload = {
+        "status": result.status,
+        "iterations": result.iterations,
+        "query_path": str(result.query_path) if result.query_path else None,
+        "feedback": result.feedback,
+        "history": result.history,
+    }
+    write_json_artifact(synthesis_dir / "synthesis_result.json", result_payload)
+    feedback = result.feedback or {}
+    if feedback:
+        write_json_artifact(final_validation, feedback)
+    _mark_stage(
+        state,
+        state_path,
+        "synthesis",
+        "completed" if result.status == "success" else "failed",
+        verdict=feedback.get("verdict"),
+        iterations=result.iterations,
+    )
+    print(f"[synthesis] {result.status}; verdict={feedback.get('verdict')}")
+
+    artifacts = {
+        "cve": cve_path,
+        "source": source_path,
+        "diff": diff_path,
+        "context": context_path,
+        "feasibility": feasibility_path,
+        "vulnerability_ir": ir_path,
+        "synthesis_result": synthesis_dir / "synthesis_result.json",
+    }
+    if final_query.is_file():
+        artifacts["query"] = final_query
+    if final_validation.is_file():
+        artifacts["validation_report"] = final_validation
+    _write_generate_report(
+        run_dir,
+        cve_id,
+        status=result.status,
+        stages=state["stages"],
+        evidence=evidence,
+        artifacts=artifacts,
+        metadata=_generate_metadata(args, evidence),
+        summary={
+            "verdict": feedback.get("verdict"),
+            "iterations": result.iterations,
+            **feedback.get("metrics", {}),
+        },
+    )
+    return 0 if result.status == "success" else 1
+
+
+def _load_generate_cve(
+    args: argparse.Namespace, cve_id: str
+) -> tuple[dict, bytes]:
+    if args.cve_file is not None:
+        raw_json = args.cve_file.read_bytes()
+        return parse_record(raw_json, cve_id), raw_json
+    cache_path = args.cache_dir / f"{cve_id}.json"
+    if cache_path.is_file() and not args.refresh:
+        raw_json = cache_path.read_bytes()
+        return parse_record(raw_json, cve_id), raw_json
+    record, raw_json = fetch_record(cve_id)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_bytes(raw_json)
+    return record, raw_json
+
+
+def _load_evidence(run_dir: Path) -> dict:
+    source = json.loads((run_dir / "source.json").read_text(encoding="utf-8"))
+    context = json.loads((run_dir / "context.json").read_text(encoding="utf-8"))
+    return {
+        "artifact_dir": str(run_dir),
+        "source": source,
+        "repo_path": source.get("repo_path"),
+        "vulnerable_commit": source.get("vulnerable_commit"),
+        "fix_commit": source.get("fix_commit"),
+        "diff": (run_dir / "diff.patch").read_text(encoding="utf-8"),
+        "diff_path": str(run_dir / "diff.patch"),
+        "context": context.get("snippets", []),
+        "context_path": str(run_dir / "context.json"),
+    }
+
+
+def _database_ready(path: Path) -> bool:
+    return (path / "codeql-database.yml").is_file()
+
+
+def _read_state(path: Path) -> dict:
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"stages": {}}
+    if not isinstance(state, dict):
+        return {"stages": {}}
+    state.setdefault("stages", {})
+    return state
+
+
+def _save_state(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        json.dump(state, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+
+
+def _mark_stage(
+    state: dict, state_path: Path, name: str, status: str, **extra: object
+) -> None:
+    state["stages"][name] = {
+        "status": status,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        **extra,
+    }
+    _save_state(state_path, state)
+
+
+def _stage_completed(state: dict, name: str) -> bool:
+    stage = state.get("stages", {}).get(name, {})
+    return isinstance(stage, dict) and stage.get("status") == "completed"
+
+
+def _generate_metadata(args: argparse.Namespace, evidence: dict) -> dict:
+    return {
+        "repo": evidence["source"].get("repository_url"),
+        "vulnerable_commit": evidence["vulnerable_commit"],
+        "fix_commit": evidence["fix_commit"],
+        "model": args.llm_model or os.environ.get("CVE2CHECKER_LLM_MODEL", "unknown"),
+        "endpoint": args.llm_base_url
+        or os.environ.get("CVE2CHECKER_LLM_BASE_URL", ""),
+        "codeql_version": args.codeql_version,
+        "strict_fixed": bool(args.strict_fixed),
+    }
+
+
+def _write_generate_report(
+    run_dir: Path,
+    cve_id: str,
+    *,
+    status: str,
+    stages: dict,
+    evidence: dict,
+    artifacts: dict,
+    metadata: dict,
+    summary: dict,
+) -> None:
+    write_run_report(
+        run_dir / "final",
+        cve_id=cve_id,
+        status=status,
+        stages=stages,
+        artifacts=artifacts,
+        metadata=metadata,
+        summary=summary,
+    )
 
 
 def _run_analyze(args: argparse.Namespace) -> int:
@@ -621,6 +1120,7 @@ def _run_synthesize(args: argparse.Namespace) -> int:
                 iteration_dir,
                 codeql_path=args.codeql_path,
                 iteration=iteration,
+                strict_fixed=args.strict_fixed,
             )
 
         result = run_synthesis(

@@ -356,7 +356,7 @@ class CliPhaseTests(unittest.TestCase):
 
         stdout = StringIO()
         with patch(
-            "cve2checker.cli.OpenAICompatibleClient.from_env", return_value=llm
+            "cve2checker.cli.llm_from_env", return_value=llm
         ):
             with redirect_stdout(stdout):
                 result = main(
@@ -402,7 +402,7 @@ class CliPhaseTests(unittest.TestCase):
 
         stdout = StringIO()
         with patch(
-            "cve2checker.cli.OpenAICompatibleClient.from_env",
+            "cve2checker.cli.llm_from_env",
             return_value=object(),
         ), patch(
             "cve2checker.cli.run_synthesis", return_value=result_value
