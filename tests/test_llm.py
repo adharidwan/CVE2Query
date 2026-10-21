@@ -6,10 +6,13 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 
 from cve2checker.llm import (
+    FallbackLLM,
     LLMError,
     OpenAICompatibleClient,
+    RetryingLLM,
     ScriptedLLM,
     _content_from_response,
+    llm_from_env,
 )
 
 
@@ -146,6 +149,71 @@ class OpenAICompatibleTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(LLMError, "BASE_URL"):
                 OpenAICompatibleClient.from_env(prefix="MISSING")
+
+
+class RetryAndFallbackTests(unittest.TestCase):
+    def test_retries_transient_errors(self) -> None:
+        class Flaky:
+            def __init__(self):
+                self.calls = 0
+
+            def complete(self, system, user, *, temperature=0.0, max_tokens=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise LLMError("HTTP 503: upstream unavailable")
+                return "ok"
+
+        client = Flaky()
+        sleeps = []
+        retrying = RetryingLLM(client, attempts=3, backoff=1.0, sleep=sleeps.append)
+        self.assertEqual(retrying.complete("s", "u"), "ok")
+        self.assertEqual(client.calls, 2)
+        self.assertEqual(sleeps, [1.0])
+
+    def test_does_not_retry_auth_errors(self) -> None:
+        class Unauthorized:
+            def __init__(self):
+                self.calls = 0
+
+            def complete(self, system, user, *, temperature=0.0, max_tokens=None):
+                self.calls += 1
+                raise LLMError("HTTP 401: invalid key")
+
+        client = Unauthorized()
+        retrying = RetryingLLM(client, attempts=3, sleep=lambda _: None)
+        with self.assertRaises(LLMError):
+            retrying.complete("s", "u")
+        self.assertEqual(client.calls, 1)
+
+    def test_fallback_uses_next_model(self) -> None:
+        class Failing:
+            def complete(self, system, user, *, temperature=0.0, max_tokens=None):
+                raise LLMError("HTTP 503")
+
+        class Working:
+            def complete(self, system, user, *, temperature=0.0, max_tokens=None):
+                return "from fallback"
+
+        fallback = FallbackLLM([Failing(), Working()])
+        self.assertEqual(fallback.complete("s", "u"), "from fallback")
+
+    def test_llm_from_env_builds_fallbacks(self) -> None:
+        environment = {
+            "TESTLLM_BASE_URL": "https://example.test/v1",
+            "TESTLLM_MODEL": "primary",
+            "TESTLLM_FALLBACK_MODELS": "backup-a,backup-b",
+            "TESTLLM_API_KEY": "key",
+            "TESTLLM_MAX_TOKENS": "1024",
+            "TESTLLM_RETRIES": "2",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            client = llm_from_env(prefix="TESTLLM")
+        self.assertIsInstance(client, RetryingLLM)
+        self.assertIsInstance(client.client, FallbackLLM)
+        self.assertEqual(
+            [item.model for item in client.client.clients],
+            ["primary", "backup-a", "backup-b"],
+        )
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol, Sequence
@@ -173,6 +174,159 @@ class OpenAICompatibleClient:
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise LLMError("LLM endpoint returned invalid JSON") from exc
         return _content_from_response(decoded)
+
+
+class RetryingLLM:
+    """Retry transient endpoint failures with exponential backoff."""
+
+    def __init__(
+        self,
+        client: LLMClient,
+        *,
+        attempts: int = 3,
+        backoff: float = 2.0,
+        sleep: Callable[[float], None] = time.sleep,
+    ):
+        if attempts < 1:
+            raise LLMError("attempts must be at least 1")
+        self.client = client
+        self.attempts = attempts
+        self.backoff = float(backoff)
+        self.sleep = sleep
+
+    def complete(
+        self,
+        system: str,
+        user: str,
+        *,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+    ) -> str:
+        last_error: LLMError | None = None
+        for attempt in range(1, self.attempts + 1):
+            try:
+                return self.client.complete(
+                    system,
+                    user,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            except LLMError as exc:
+                last_error = exc
+                if attempt >= self.attempts or not _retryable(exc):
+                    raise
+                self.sleep(self.backoff * (2 ** (attempt - 1)))
+        raise last_error or LLMError("LLM request failed")
+
+
+class FallbackLLM:
+    """Try multiple models in order, moving on only after an LLM failure."""
+
+    def __init__(self, clients: Sequence[LLMClient]):
+        self.clients = list(clients)
+        if not self.clients:
+            raise LLMError("at least one LLM client is required")
+
+    def complete(
+        self,
+        system: str,
+        user: str,
+        *,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+    ) -> str:
+        last_error: LLMError | None = None
+        for client in self.clients:
+            try:
+                return client.complete(
+                    system,
+                    user,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            except LLMError as exc:
+                last_error = exc
+        raise last_error or LLMError("all LLM clients failed")
+
+
+def build_llm_client(
+    *,
+    base_url: str,
+    model: str,
+    api_key: str | None = None,
+    timeout: float = 180.0,
+    max_tokens: int = 32_768,
+    fallback_models: Sequence[str] | None = None,
+    attempts: int = 3,
+    backoff: float = 2.0,
+) -> LLMClient:
+    models = [model]
+    for fallback in fallback_models or []:
+        if fallback and fallback not in models:
+            models.append(fallback)
+    clients = [
+        OpenAICompatibleClient(
+            base_url=base_url,
+            model=candidate,
+            api_key=api_key,
+            timeout=timeout,
+            max_tokens=max_tokens,
+        )
+        for candidate in models
+    ]
+    inner: LLMClient = clients[0] if len(clients) == 1 else FallbackLLM(clients)
+    return RetryingLLM(inner, attempts=attempts, backoff=backoff)
+
+
+def llm_from_env(prefix: str = "CVE2CHECKER_LLM") -> LLMClient:
+    base_url = os.environ.get(f"{prefix}_BASE_URL", "")
+    model = os.environ.get(f"{prefix}_MODEL", "")
+    if not base_url or not model:
+        raise LLMError(
+            f"set {prefix}_BASE_URL and {prefix}_MODEL to use the LLM backend"
+        )
+    fallback_models = [
+        item.strip()
+        for item in os.environ.get(f"{prefix}_FALLBACK_MODELS", "").replace(
+            ";", ","
+        ).split(",")
+        if item.strip()
+    ]
+    return build_llm_client(
+        base_url=base_url,
+        model=model,
+        api_key=(
+            os.environ.get(f"{prefix}_API_KEY")
+            or os.environ.get("OPENCODE_API_KEY")
+            or None
+        ),
+        timeout=float(os.environ.get(f"{prefix}_TIMEOUT", "180")),
+        max_tokens=int(os.environ.get(f"{prefix}_MAX_TOKENS", "32768")),
+        fallback_models=fallback_models,
+        attempts=int(os.environ.get(f"{prefix}_RETRIES", "3")),
+        backoff=float(os.environ.get(f"{prefix}_BACKOFF", "2")),
+    )
+
+
+def _retryable(error: LLMError) -> bool:
+    message = str(error).lower()
+    non_retryable = ("http 400", "http 401", "http 403", "http 404")
+    if any(marker in message for marker in non_retryable):
+        return False
+    retryable = (
+        "http 429",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+        "timed out",
+        "timeout",
+        "could not reach",
+        "connection",
+        "temporarily",
+        "overloaded",
+    )
+    return any(marker in message for marker in retryable)
 
 
 def _content_from_response(payload: Any) -> str:
