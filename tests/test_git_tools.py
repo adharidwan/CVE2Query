@@ -5,6 +5,7 @@ from pathlib import Path
 
 from cve2checker.git_tools import (
     GitError,
+    add_worktree,
     checkout_commit,
     clone_repository,
     current_commit,
@@ -77,6 +78,16 @@ class GitToolTests(unittest.TestCase):
             resolve_parent(self.repo, "--upload-pack=evil")
         with self.assertRaises(GitError):
             show_file(self.repo, self.second, "../outside.c")
+
+    def test_add_worktree_and_reuse_it(self) -> None:
+        destination = Path(self.temporary_directory.name) / "worktree"
+        created = add_worktree(self.repo, destination, self.first)
+        self.assertEqual(created, destination.resolve())
+        self.assertIn(
+            "int main(void) { return 0; }",
+            (created / "sample.c").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(add_worktree(self.repo, destination, self.first), created)
 
     def test_clone_local_repository(self) -> None:
         destination = Path(self.temporary_directory.name) / "clone"

@@ -73,6 +73,29 @@ def clone_repository(
     return target
 
 
+def add_worktree(
+    repository: str | os.PathLike[str],
+    destination: str | os.PathLike[str],
+    commit: str,
+) -> Path:
+    """Create (or reuse) a detached worktree at a commit."""
+    _validate_commitish(commit)
+    repo_path = Path(repository).expanduser().resolve()
+    target = Path(destination).expanduser().resolve()
+    if target.exists():
+        if (target / ".git").exists():
+            return target
+        if any(target.iterdir()):
+            raise GitError(f"worktree destination is not empty: {target}")
+        target.rmdir()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    run_git(
+        ["worktree", "add", "--detach", str(target), commit],
+        cwd=repo_path,
+    )
+    return target
+
+
 def checkout_commit(
     repository: str | os.PathLike[str], commit: str, *, timeout: float = 300.0
 ) -> None:
