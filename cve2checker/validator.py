@@ -26,6 +26,7 @@ def validate_query(
     codeql_path: str | os.PathLike[str] = "codeql",
     iteration: int = 1,
     precision_threshold: float = 0.5,
+    strict_fixed: bool = False,
 ) -> dict[str, Any]:
     """Compile, execute, and score a query against vulnerable/fixed databases."""
     query = Path(query_path)
@@ -41,6 +42,7 @@ def validate_query(
         "iteration": int(iteration),
         "query_path": str(query.resolve()),
         "query_sha256": hashlib.sha256(query.read_bytes()).hexdigest(),
+        "strict_fixed": bool(strict_fixed),
         "compile": {"ok": False, "errors": []},
         "vulnerable": {"ok": False, "match_count": 0, "diff_intersection_count": 0, "traces": []},
         "fixed": {"ok": False, "match_count": 0, "diff_intersection_count": 0, "traces": []},
@@ -120,6 +122,7 @@ def validate_query(
 
     vulnerable_hits = int(feedback["vulnerable"]["diff_intersection_count"])
     fixed_hits = int(feedback["fixed"]["diff_intersection_count"])
+    fixed_matches = int(feedback["fixed"]["match_count"])
     if vulnerable_hits == 0:
         feedback["verdict"] = "detection_failed"
         feedback["next_actions"] = _detection_actions(feedback)
@@ -129,6 +132,12 @@ def validate_query(
             "The fixed database still matches the patched region.",
             "Add or strengthen the sanitizer/barrier for the behavior introduced by the fix.",
             "Narrow sources or sinks so the patched path no longer qualifies.",
+        ]
+    elif strict_fixed and fixed_matches > 0:
+        feedback["verdict"] = "discrimination_failed"
+        feedback["next_actions"] = [
+            "Strict mode rejects every fixed-side alert, even outside the patch.",
+            "Narrow the source/sink pattern to the CVE-specific behavior.",
         ]
     else:
         feedback["verdict"] = "success"
@@ -240,6 +249,7 @@ def _metrics(feedback: dict[str, Any]) -> dict[str, Any]:
         "recall": recall,
         "precision": precision,
         "f1": f1,
+        "fixed_alerts": int(feedback["fixed"]["match_count"]),
     }
 
 

@@ -50,7 +50,7 @@ class ValidatorTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
 
-    def _run(self, vulnerable=None, fixed=None):
+    def _run(self, vulnerable=None, fixed=None, strict_fixed=False):
         vulnerable = self.vulnerable if vulnerable is None else vulnerable
         fixed = self.fixed if fixed is None else fixed
 
@@ -69,6 +69,7 @@ class ValidatorTests(unittest.TestCase):
                 "db-fixed",
                 self.changed,
                 self.workdir,
+                strict_fixed=strict_fixed,
             )
 
     def test_success_requires_vulnerable_hit_and_no_fixed_hit(self) -> None:
@@ -87,6 +88,14 @@ class ValidatorTests(unittest.TestCase):
     def test_fixed_intersection_is_discrimination_failure(self) -> None:
         feedback = self._run(fixed=sarif_document("src/copy.c", 3))
         self.assertEqual(feedback["verdict"], "discrimination_failed")
+
+    def test_strict_fixed_rejects_alert_outside_diff(self) -> None:
+        feedback = self._run(
+            fixed=sarif_document("src/copy.c", 10), strict_fixed=True
+        )
+        self.assertEqual(feedback["verdict"], "discrimination_failed")
+        self.assertEqual(feedback["metrics"]["fixed_alerts"], 1)
+        self.assertTrue(feedback["strict_fixed"])
 
     def test_compile_failure(self) -> None:
         with patch(
