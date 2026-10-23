@@ -69,6 +69,8 @@ class ToolBox:
             raise ToolError("tool arguments must be an object")
 
         handlers: dict[str, Callable[[dict[str, Any]], Any]] = {
+            "list_tools": self._list_tools,
+            "harness_tools_list": self._list_tools,
             "rag_search": self._rag_search,
             "rag_get": self._rag_get,
             "read_file": self._read_file,
@@ -87,6 +89,23 @@ class ToolBox:
                 f"unknown tool {name!r}; available tools: {', '.join(sorted(handlers))}"
             )
         return _render(handler(args), self.max_output_chars)
+
+    def _list_tools(self, args: dict[str, Any]) -> Any:
+        return {
+            "tools": [
+                "rag_search(collection, query, k)",
+                "rag_get(collection, ids, where, limit)",
+                "read_file(path, start_line, end_line)",
+                "list_dir(path)",
+                "search_text(path, pattern, max_results)",
+                "lsp_update(path, content)",
+                "lsp_diagnostics(path)",
+                "lsp_hover(path, line, character)",
+                "lsp_definition(path, line, character)",
+                "lsp_completion(path, line, character)",
+                "lsp_format(path)",
+            ]
+        }
 
     def _rag_search(self, args: dict[str, Any]) -> Any:
         self._require_rag()
@@ -457,6 +476,15 @@ def _agent_query(
                 value = payload.get(key)
                 if isinstance(value, str) and value.strip():
                     return value.strip().strip("`"), tool_calls
+            if (
+                "tool" not in payload
+                and isinstance(payload.get("name"), str)
+                and "arguments" in payload
+            ):
+                payload = {
+                    "tool": payload["name"],
+                    "arguments": payload.get("arguments") or {},
+                }
             if "tool" not in payload:
                 continue
             if tool_calls >= max_tool_calls:

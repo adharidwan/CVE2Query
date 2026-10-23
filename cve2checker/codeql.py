@@ -34,6 +34,9 @@ def create_cpp_database(
     if build_mode is not None and build_mode not in {"autobuild", "none"}:
         raise ValueError("build_mode must be 'autobuild' or 'none'")
 
+    Path(database_path).expanduser().resolve().parent.mkdir(
+        parents=True, exist_ok=True
+    )
     arguments = [
         "database",
         "create",

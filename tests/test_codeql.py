@@ -18,19 +18,23 @@ from cve2checker.codeql import (
 class CodeQLWrapperTests(unittest.TestCase):
     def test_create_cpp_database_passes_optional_build_command_as_one_argument(self) -> None:
         completed = subprocess.CompletedProcess([], 0, stdout="created", stderr="")
-        source_root = r"C:\work\source tree"
-        database_path = r"C:\work\analysis database"
-        codeql_path = r"C:\Program Files\CodeQL\codeql.exe"
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_root = root / "source tree"
+            database_path = root / "analysis database"
+            codeql_path = r"C:\Program Files\CodeQL\codeql.exe"
 
-        with patch(
-            "cve2checker.codeql.subprocess.run", return_value=completed
-        ) as run:
-            result = create_cpp_database(
-                source_root,
-                database_path,
-                build_command="cmake --build build dir",
-                codeql_path=codeql_path,
-            )
+            with patch(
+                "cve2checker.codeql.subprocess.run", return_value=completed
+            ) as run:
+                result = create_cpp_database(
+                    source_root,
+                    database_path,
+                    build_command="cmake --build build dir",
+                    codeql_path=codeql_path,
+                )
+
+            self.assertTrue(database_path.parent.is_dir())
 
         self.assertIs(result, completed)
         run.assert_called_once_with(
@@ -42,7 +46,7 @@ class CodeQLWrapperTests(unittest.TestCase):
                 f"--source-root={source_root}",
                 "--command=cmake --build build dir",
                 "--",
-                database_path,
+                str(database_path),
             ],
             shell=False,
             check=False,
@@ -200,6 +204,16 @@ class CodeQLWrapperTests(unittest.TestCase):
             ):
                 analyze_query("db", "query.ql", sarif)
             self.assertTrue(sarif.parent.is_dir())
+
+    def test_create_cpp_database_creates_parent_directory(self) -> None:
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with TemporaryDirectory() as temporary_directory:
+            database = Path(temporary_directory) / "nested" / "db"
+            with patch(
+                "cve2checker.codeql.subprocess.run", return_value=completed
+            ):
+                create_cpp_database("src", database)
+            self.assertTrue(database.parent.is_dir())
 
     def test_ensure_query_pack_creates_and_installs_pack(self) -> None:
         with TemporaryDirectory() as temporary_directory:

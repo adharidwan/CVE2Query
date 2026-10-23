@@ -421,6 +421,7 @@ def extract_dsml_tool_calls(text: str) -> list[Any]:
     """Extract tool calls emitted in the DSML format used by some models."""
     if not isinstance(text, str) or "DSML" not in text:
         return []
+    text = _normalise_tool_delimiters(text)
     calls: list[Any] = []
     for match in _DSML_INVOKE.finditer(text):
         name = html.unescape(match.group(1).strip())
@@ -535,6 +536,19 @@ def _strip_query_fences(text: str) -> str:
     if sentinel != -1:
         stripped = stripped[:sentinel].rstrip()
     return stripped
+
+
+def _normalise_tool_delimiters(text: str) -> str:
+    return text.translate(
+        str.maketrans(
+            {
+                "\uff5c": "|",
+                "\u2502": "|",
+                "\ufe31": "|",
+                "\ufe32": "|",
+            }
+        )
+    )
 
 
 def _first_balanced_object(text: str) -> str | None:

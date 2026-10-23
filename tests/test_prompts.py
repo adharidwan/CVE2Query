@@ -114,6 +114,18 @@ class ResponseExtractionTests(unittest.TestCase):
         self.assertEqual(calls[0]["arguments"]["path"], "inflate.c")
         self.assertEqual(calls[0]["arguments"]["start_line"], 700)
 
+    def test_extract_dsml_with_fullwidth_bars(self) -> None:
+        text = (
+            "<\uff5c\uff5cDSML\uff5c\uff5c calls>\n"
+            '<\uff5c\uff5cDSML\uff5c\uff5c invoke name="rag_search">\n'
+            '<\uff5c\uff5cDSML\uff5c\uff5c parameter name="collection" string="true">examples</\uff5c\uff5cDSML\uff5c\uff5c parameter>\n'
+            "</\uff5c\uff5cDSML\uff5c\uff5c invoke>\n"
+            "</\uff5c\uff5cDSML\uff5c\uff5c calls>"
+        )
+        calls = extract_dsml_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["tool"], "rag_search")
+
     def test_extract_xml_tool_calls(self) -> None:
         text = (
             "<tool_call><function=list_dir><parameter=path>.</parameter>"

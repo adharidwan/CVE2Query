@@ -153,6 +153,10 @@ class ToolBoxTests(unittest.TestCase):
         )
         self.assertEqual(diagnostics[0]["message"], "ok")
 
+    def test_list_tools(self) -> None:
+        result = json.loads(self.tools.execute("harness_tools_list", {}))
+        self.assertTrue(any("rag_search" in item for item in result["tools"]))
+
     def test_unknown_tool_is_rejected(self) -> None:
         with self.assertRaisesRegex(ToolError, "unknown tool"):
             self.tools.execute("shell", {"command": "whoami"})
@@ -239,6 +243,20 @@ class SynthesisLoopTests(unittest.TestCase):
         self.assertEqual(result.status, "success")
         self.assertEqual(result.history[0]["tool_calls"], 1)
         self.assertIn("TOOL RESULT for rag_search", llm.calls[1]["user"])
+
+    def test_named_tool_call_format(self) -> None:
+        response = (
+            "<tool_call>\n"
+            '{"name": "rag_search", "arguments": {"collection": "examples", '
+            '"query": "strcpy"}}\n'
+            "</tool_call>"
+        )
+        llm = ScriptedLLM([response, json.dumps({"final": QUERY})])
+        result = self._run(
+            llm, lambda query, directory, iteration: {"verdict": "success"}
+        )
+        self.assertEqual(result.status, "success")
+        self.assertEqual(result.history[0]["tool_calls"], 1)
 
     def test_dsml_tool_call_then_final_query(self) -> None:
         dsml = (
