@@ -6,5 +6,6 @@ __pycache__/
 .tools/
 artifacts/
 artifacts-demo/
+artifacts-bench/
 codeql-db/
 *.sarif
